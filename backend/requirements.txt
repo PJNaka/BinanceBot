@@ -13,4 +13,7 @@ tavily-python
 httpx
 beautifulsoup4
 lxml
+groq
+openai
+# google-generativeai # For Google Gemini, if/when implemented
 # Add other dependencies as needed

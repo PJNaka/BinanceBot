@@ -19,6 +19,11 @@ GROQ_API_KEY = "your_groq_api_key_here"
 # Example for OpenAI API
 OPENAI_API_KEY = "your_openai_api_key_here"
 # Get yours from https://platform.openai.com/api-keys
+OPENAI_API_BASE_URL = None # Optional: For custom OpenAI-compatible endpoints or proxies. E.g., "http://localhost:1234/v1"
+
+# Example for Google Gemini API
+GEMINI_API_KEY = "your_gemini_api_key_here"
+# Get yours from https://makersuite.google.com/app/apikey
 
 # Generic LLM API Key (if you implement a client that uses a generic key)
 # LLM_API_KEY = "your_llm_api_key_here"
