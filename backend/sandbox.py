@@ -26,12 +26,19 @@ class SandboxExecutionResult:
 def execute_python_code_in_docker(code_string: str, python_image: str = DEFAULT_PYTHON_IMAGE, timeout_seconds: int = 30) -> SandboxExecutionResult:
     client = None
     try:
+        # Attempt to connect to the Docker daemon using environment variables.
+        # This is the standard way to initialize the Docker client.
         client = docker.from_env()
     except docker.errors.DockerException as e:
+        # This typically means Docker is not running or not accessible.
         return SandboxExecutionResult(error=f"Docker daemon not available or configuration error: {e}")
 
-    # Create a temporary file to hold the user's Python code
-    # This is generally safer than passing complex code directly via command line
+    # Create a temporary file on the host to hold the user's Python code.
+    # The code is written to this file, which is then volume-mounted into the Docker container.
+    # This approach is generally safer than passing complex code directly via command line arguments,
+    # especially for multi-line scripts or scripts with special characters.
+    # `delete=False` is used because the file needs to exist until Docker is done with it;
+    # manual unlinking is done in the `finally` block.
     tmp_script_name_host = "" # Initialize to prevent NameError in finally if tempfile.NamedTemporaryFile fails
     try:
         with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode='w') as tmp_script:
@@ -53,18 +60,34 @@ def execute_python_code_in_docker(code_string: str, python_image: str = DEFAULT_
             client.images.pull(python_image)
             print("Image pulled.")
 
+        # Define volume mapping: host's temporary script file to a fixed path inside the container.
+        # 'ro' mode ensures the script cannot be modified from within the container, enhancing security.
         volumes_spec = {tmp_script_name_host: {'bind': tmp_script_name_container, 'mode': 'ro'}}
         
+        # Run the Docker container.
+        # - image: The specified Python image (e.g., "python:3.10-slim").
+        # - command: The command to run inside the container (execute the Python script).
+        # - volumes: Mounts the temporary script file (read-only).
+        # - detach=True: Runs the container in the background and returns a Container object.
+        # - mem_limit="256m": Restricts container memory usage to 256MB.
+        # - network_mode: Defaults to 'bridge', allowing outbound network access.
+        #   For stricter isolation where no network is needed: network_mode='none'.
+        #   However, bridge mode is often needed for packages or data fetching.
         container = client.containers.run(
             image=python_image,
             command=["python", tmp_script_name_container],
             volumes=volumes_spec,
-            detach=True,
-            mem_limit="256m",
-            # stop_signal="SIGKILL", # More forceful stop, but can prevent cleanup in script
+            detach=True, 
+            mem_limit="256m", # Resource limit: Memory
+            # stop_signal="SIGKILL", # More forceful stop, but can prevent cleanup in script. Default is SIGTERM.
+            # ulimits: Can set ulimits if needed, e.g., for CPU time or file sizes (more complex).
+            # security_opt: Can set security options like "no-new-privileges".
         )
 
         try:
+            # Resource limit: Timeout mechanism.
+            # container.wait() can block indefinitely if the underlying HTTP request times out
+            # or if the container itself hangs. This loop provides a more proactive timeout.
             # container.wait() can block indefinitely if timeout is not handled by requests
             # Using a loop with status check for more robust timeout for the container itself
             for _ in range(timeout_seconds * 2): # Check status twice per second
@@ -86,23 +109,25 @@ def execute_python_code_in_docker(code_string: str, python_image: str = DEFAULT_
             # Check logs if possible, but container is gone
             return SandboxExecutionResult(error="Container not found during execution, possibly due to OOM error or external removal.", exit_code=None, execution_time=execution_time)
         except Exception as e: # Catch other exceptions during wait/stop, e.g. ReadTimeout from requests
-            # This catch block is to handle timeouts from the `container.wait()` call itself,
-            # or other docker-py issues during the wait.
+            # This catch block is to handle timeouts from the `container.wait()` call itself (less likely with the loop),
+            # or other docker-py/requests issues during the wait/stop operations.
             if container and container.status != 'exited': # Check if container exists and is running
                 try:
-                    container.stop(timeout=5) # Attempt to stop it
+                    container.stop(timeout=5) # Attempt to stop it gracefully if primary timeout failed
                 except docker.errors.APIError as stop_err:
-                    print(f"Error stopping container during timeout handling: {stop_err}")
+                    print(f"Error stopping container during exception handling: {stop_err}")
 
             execution_time = time.time() - start_time
-            # Check if the error message string indicates a timeout
+            # Check if the error message string indicates a timeout from the requests library used by docker-py
             if "read timed out" in str(e).lower() or "timeout" in str(e).lower():
-                 return SandboxExecutionResult(error=f"Execution timed out after {timeout_seconds} seconds (wait op).", execution_time=execution_time)
-            return SandboxExecutionResult(error=f"Error waiting for container: {e}", execution_time=execution_time)
+                 return SandboxExecutionResult(error=f"Execution timed out after {timeout_seconds} seconds (docker-py/requests op).", execution_time=execution_time)
+            return SandboxExecutionResult(error=f"Error during container wait/stop: {e}", execution_time=execution_time)
 
 
         execution_time = time.time() - start_time
         
+        # Retrieve logs from the container.
+        # `errors='ignore'` helps prevent issues with non-UTF-8 characters in output.
         stdout = container.logs(stdout=True, stderr=False).decode('utf-8', errors='ignore').strip()
         stderr = container.logs(stdout=False, stderr=True).decode('utf-8', errors='ignore').strip()
 
@@ -124,21 +149,22 @@ def execute_python_code_in_docker(code_string: str, python_image: str = DEFAULT_
     except docker.errors.ImageNotFound:
         execution_time = time.time() - start_time if start_time else 0
         return SandboxExecutionResult(error=f"Docker image {python_image} not found.", execution_time=execution_time)
-    except docker.errors.APIError as e: # Covers container creation failure, etc.
-        execution_time = time.time() - start_time if start_time else 0
+    except docker.errors.APIError as e: # Covers container creation failure, image pull issues not caught by ImageNotFound, etc.
+        execution_time = time.time() - start_time if 'start_time' in locals() else 0
         return SandboxExecutionResult(error=f"Docker API error: {e}", execution_time=execution_time)
-    except Exception as e:
-        execution_time = time.time() - start_time if start_time else 0
-        return SandboxExecutionResult(error=f"An unexpected error occurred: {e}", execution_time=execution_time)
+    except Exception as e: # Catch-all for any other unexpected errors.
+        execution_time = time.time() - start_time if 'start_time' in locals() else 0
+        return SandboxExecutionResult(error=f"An unexpected error occurred in sandbox execution: {e}", execution_time=execution_time)
     finally:
+        # Ensure cleanup of container and temporary script file.
         if container:
             try:
-                container.remove(force=True)
+                container.remove(force=True) # Force removal ensures it's cleaned up even if stopped abruptly.
             except docker.errors.APIError as e:
-                print(f"Warning: Could not remove container {container.id[:12]}: {e}")
+                print(f"Warning: Could not remove container {container.id[:12] if hasattr(container, 'id') else 'unknown'}: {e}")
         if tmp_script_name_host and os.path.exists(tmp_script_name_host):
             try:
-                os.unlink(tmp_script_name_host)
+                os.unlink(tmp_script_name_host) # Delete the temporary script from the host.
             except Exception as e:
                 print(f"Warning: Could not remove temporary script {tmp_script_name_host}: {e}")
 

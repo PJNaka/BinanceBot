@@ -1,19 +1,27 @@
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
-from typing import List, Dict, Any, Callable, Awaitable
+from typing import List, Dict, Any, Callable, Awaitable, Tuple, Optional # Added Depends, Query, status, Tuple, Optional
+from sqlalchemy.orm import Session # For DB session in WebSocket
 
 # Adjust imports based on your project structure
-# Assuming main.py is in 'backend/' and agent.py, data.py are also in 'backend/'
 try:
-    from .agent import AutonomousAgent, AgentOutput, LLMClient, ReactPhase # Relative imports
+    from .agent import AutonomousAgent, AgentOutput, LLMClient, ReactPhase
     from .data import load_elements
-    # from .sandbox import SandboxExecutionResult # Not directly used in main.py models anymore
+    from .api import auth_routes # Contains get_current_active_user
+    from .api.auth_routes import get_current_active_user # Explicit import for endpoint dependency
+    from . import crud_user, models, auth_utils # For WebSocket auth
+    from .db_setup import get_db # For WebSocket auth
+    from .redis_client import init_redis_pool, close_redis_pool
 except ImportError: # Fallback for scenarios where main.py might be run directly as a script
     from agent import AutonomousAgent, AgentOutput, LLMClient, ReactPhase
     from data import load_elements
-    # from sandbox import SandboxExecutionResult
+    from api import auth_routes
+    from api.auth_routes import get_current_active_user
+    import crud_user, models, auth_utils # Fallback for WebSocket auth
+    from db_setup import get_db # Fallback for WebSocket auth
+    from redis_client import init_redis_pool, close_redis_pool
 
 
 # Pydantic Models for robust API contracts
@@ -42,38 +50,36 @@ class GenerateCommandRequest(BaseModel):
 # Connection Manager for WebSockets
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
+        self.active_connections: Dict[str, Tuple[WebSocket, Any]] = {} # client_id: (WebSocket, user_id)
 
-    async def connect(self, websocket: WebSocket, client_id: str):
+    async def connect(self, websocket: WebSocket, client_id: str, user_id: Any): # Added user_id
         await websocket.accept()
-        self.active_connections[client_id] = websocket
-        print(f"Client #{client_id} connected via WebSocket.")
+        self.active_connections[client_id] = (websocket, user_id)
+        print(f"Client {client_id} (User {user_id}) connected via WebSocket.")
 
     def disconnect(self, client_id: str):
         if client_id in self.active_connections:
-            # Optional: Add logic to await close if websocket is still in a valid state
-            # try:
-            #     if self.active_connections[client_id].client_state == WebSocketState.CONNECTED:
-            #         # await self.active_connections[client_id].close() # This can also raise
-            #         pass
-            # except Exception:
-            #     pass # Ignore errors on close, client might be gone
-            del self.active_connections[client_id]
-            print(f"Client #{client_id} disconnected.")
+            websocket_tuple = self.active_connections.pop(client_id, None) # Use pop to get and remove
+            if websocket_tuple:
+                user_id = websocket_tuple[1]
+                print(f"Client {client_id} (User {user_id}) disconnected from WebSocket.")
+            else: # Should not happen if key was in active_connections
+                print(f"Client {client_id} disconnected (user ID not found in tuple).")
+
 
     async def send_personal_message(self, message: dict, client_id: str):
         if client_id in self.active_connections:
-            websocket = self.active_connections[client_id]
+            websocket, user_id = self.active_connections[client_id] # Unpack user_id for potential logging
             try:
                 await websocket.send_json(message)
             except WebSocketDisconnect:
-                print(f"Client #{client_id} disconnected (WebSocketDisconnect during send). Removing.")
+                print(f"Client {client_id} (User {user_id}) disconnected (WebSocketDisconnect during send). Removing.")
+                self.disconnect(client_id) # disconnect will handle removal from dict
+            except RuntimeError as e: 
+                print(f"RuntimeError sending to client {client_id} (User {user_id}): {e}. Removing connection.")
                 self.disconnect(client_id)
-            except RuntimeError as e: # Handles "Cannot call send after connection is closed."
-                print(f"RuntimeError sending to client #{client_id}: {e}. Removing connection.")
-                self.disconnect(client_id)
-            except Exception as e: # Catch any other unexpected error during send
-                print(f"Unexpected error sending JSON to client #{client_id}: {type(e).__name__} - {e}. Removing.")
+            except Exception as e: 
+                print(f"Unexpected error sending JSON to client {client_id} (User {user_id}): {type(e).__name__} - {e}. Removing.")
                 self.disconnect(client_id)
 
 manager = ConnectionManager()
@@ -83,6 +89,18 @@ app = FastAPI(
     description="API for interacting with an AI agent that uses REACT + CoT to generate and test code.",
     version="0.1.0"
 )
+
+# Event handlers for Redis pool lifecycle
+@app.on_event("startup")
+async def startup_event():
+    await init_redis_pool()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await close_redis_pool()
+
+# Include the authentication router
+app.include_router(auth_routes.router)
 
 # CORS Middleware
 app.add_middleware(
@@ -95,50 +113,74 @@ app.add_middleware(
 
 # Initialize Agent and LLMClient (placeholder)
 llm_client = LLMClient() 
-autonomous_agent = AutonomousAgent(llm_client=llm_client)
+autonomous_agent = AutonomousAgent(llm_client=llm_client) # Agent itself does not need db session directly
 
 
 # WebSocket Endpoint
 @app.websocket("/ws/agent-updates/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    await manager.connect(websocket, client_id)
+async def websocket_endpoint(
+    websocket: WebSocket, 
+    client_id: str, 
+    token: Optional[str] = Query(None), # Token from query parameter
+    db: Session = Depends(get_db) # DB session for user validation
+):
+    if not token:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Missing auth token")
+        return
+
+    payload = auth_utils.decode_access_token(token) # Uses SECRET_KEY and ALGORITHM from auth_utils
+    if not payload or not payload.get("sub"):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")
+        return
+    
+    username = payload["sub"]
+    user = crud_user.get_user_by_username(db, username=username)
+
+    if not user or not user.is_active:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="User not found or inactive")
+        return
+
+    # User is authenticated, extract user_id
+    user_id = user.id
+    await manager.connect(websocket, client_id, user_id) # Pass user_id to manager
+    
     try:
         while True:
-            # This loop keeps the connection alive and can optionally process incoming messages.
-            # If the frontend is only receiving, it might not send data often.
-            # A keep-alive mechanism (e.g., client sends ping, server sends pong) can be implemented if needed.
+            # Keep connection alive, or handle incoming client messages if any.
+            # For this app, WS is primarily for server-to-client updates.
             data = await websocket.receive_text() 
-            # For debugging or if client sends specific messages:
-            print(f"Received message from client #{client_id} via WebSocket: {data}")
-            # Example: Echo back or process specific client commands
-            # await manager.send_personal_message({"received": data}, client_id)
+            # print(f"Client {client_id} (User {user_id}) sent: {data}") # For debugging client messages
+            # Example: await manager.send_personal_message({"echo_from_user": user_id, "data": data}, client_id)
     except WebSocketDisconnect:
-        # This exception is expected when the client closes the connection.
-        # manager.disconnect logs this.
-        manager.disconnect(client_id)
+        manager.disconnect(client_id) # Handles removal from active_connections and logging
     except Exception as e:
-        # Catch any other unexpected errors during the WebSocket lifecycle.
-        print(f"Unexpected error in WebSocket connection for client #{client_id}: {type(e).__name__} - {e}")
+        # Log any other exceptions that occur during the WebSocket connection
+        print(f"WebSocket error for client {client_id} (User {user_id}): {type(e).__name__} - {e}")
         manager.disconnect(client_id) # Ensure cleanup
 
 
 # API Endpoints
 
 @app.post("/generate", response_model=AgentOutputModel)
-async def generate_code_endpoint(request: GenerateCommandRequest):
+async def generate_code_endpoint(
+    request: GenerateCommandRequest, # Assumes GenerateCommandRequest has client_id
+    # db: Session = Depends(get_db), # Not directly needed by agent, but available if other ops were here
+    current_user: models.User = Depends(get_current_active_user) # Authentication
+):
     
     async def agent_update_callback(update_data: Dict):
         # Check if client is still connected before sending
+        # request.client_id is from the Pydantic model, which should be the same as connected ws client_id
         if request.client_id in manager.active_connections:
             await manager.send_personal_message(update_data, request.client_id)
         else:
-            # This can happen if client disconnects while agent is still processing.
-            print(f"Client #{request.client_id} disconnected during agent processing. Update not sent: {update_data.get('type')}")
+            print(f"Client #{request.client_id} (User {current_user.id}) disconnected during agent processing. Update not sent: {update_data.get('type')}")
 
     try:
-        # Pass the command and the callback to the agent
         agent_class_output: AgentOutput = await autonomous_agent.process_command(
-            request.command,
+            user_command=request.command,
+            user_id=current_user.id, # Use authenticated user's ID
+            session_id=request.client_id, # Use client_id from request as session_id
             update_callback=agent_update_callback
         )
         

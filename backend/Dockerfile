@@ -6,6 +6,12 @@ WORKDIR /app
 
 # Copy requirements file and install dependencies
 COPY requirements.txt .
+
+# Install system dependencies for mysqlclient and other potential packages
+RUN apt-get update && \
+    apt-get install -y default-libmysqlclient-dev gcc && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the backend application code

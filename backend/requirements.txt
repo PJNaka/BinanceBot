@@ -1,4 +1,16 @@
 fastapi
 uvicorn[standard]
 docker
+sqlalchemy
+alembic
+mysqlclient
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
+email-validator
+redis
+tavily-python
+httpx
+beautifulsoup4
+lxml
 # Add other dependencies as needed

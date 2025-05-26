@@ -1,13 +1,22 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Container, Grid, Paper, Typography, Box, List, ListItem, ListItemText } from '@mui/material'; // Added List, ListItem, ListItemText
+import { Container, Grid, Paper, Typography, Box, Button, CircularProgress } from '@mui/material'; // Added Button, CircularProgress
 import CommandInput from './components/CommandInput';
 import AgentThoughts from './components/AgentThoughts';
 import CodeDisplay from './components/CodeDisplay'; 
 import ResultsDisplay from './components/ResultsDisplay'; 
 import ScienceDataDisplay from './components/ScienceDataDisplay'; 
 import FrontendSandbox from './components/FrontendSandbox'; 
-import FrontendSandboxLogs from './components/FrontendSandboxLogs'; // Import FrontendSandboxLogs
-import { sendGenerateCommand, fetchScienceData, connectWebSocket } from './services/api';
+import FrontendSandboxLogs from './components/FrontendSandboxLogs';
+import LoginForm from './components/LoginForm'; // Import LoginForm
+import RegisterForm from './components/RegisterForm'; // Import RegisterForm
+import { 
+    sendGenerateCommand, 
+    fetchScienceData, 
+    connectWebSocket,
+    logoutUser,         // Import logoutUser
+    fetchCurrentUser    // Import fetchCurrentUser
+    // token as currentToken, // Not using direct token export, relying on fetchCurrentUser
+} from './services/api';
 import './App.css';
 
 // Function to generate a simple unique ID
@@ -28,6 +37,11 @@ function App() {
   const [frontendCss, setFrontendCss] = useState('');
   const [frontendJs, setFrontendJs] = useState('');
   const [frontendSandboxLogEntries, setFrontendSandboxLogEntries] = useState([]);
+
+  // Auth state
+  const [currentUser, setCurrentUser] = useState(null);
+  const [isLoadingAuth, setIsLoadingAuth] = useState(true); // For initial auth check
+  const [showLogin, setShowLogin] = useState(true); // true for Login, false for Register
 
   const ws = useRef(null);
 
@@ -53,6 +67,19 @@ function App() {
     // setFrontendCss('body { background-color: #f0f8ff; color: darkblue; } h1 { font-style: italic; } button { padding: 5px; background-color: lightgreen; }');
     // setFrontendJs('console.log("JavaScript executed in frontend sandbox!"); console.warn("A warning from sandbox."); setTimeout(() => { try { document.getElementById("testdiv").innerText = "Async op complete!"; nonExistentFunc(); } catch(e) { console.error("Simulated error in sandbox:", e); } }, 1000); Promise.reject("Simulated unhandled promise rejection");');
     // setFrontendSandboxLogEntries([]); // Clear logs on new content set by this test
+
+    const checkAuth = async () => {
+      setIsLoadingAuth(true);
+      try {
+        const user = await fetchCurrentUser(); 
+        setCurrentUser(user); 
+      } catch (error) {
+        setCurrentUser(null); 
+      } finally {
+        setIsLoadingAuth(false);
+      }
+    };
+    checkAuth();
     
   }, []); // Run only once on mount
 
@@ -67,13 +94,28 @@ function App() {
     setFrontendSandboxLogEntries(prevLogs => [...prevLogs, timestampedMessage]);
   };
 
+  // WebSocket connection logic
   useEffect(() => {
-    if (!clientId) return; // Don't connect if no clientId yet
+    if (!clientId || !currentUser) { // DON'T CONNECT IF NOT LOGGED IN or no clientID
+      if (ws.current && (ws.current.readyState === WebSocket.OPEN || ws.current.readyState === WebSocket.CONNECTING)) {
+         console.log("Closing WebSocket due to user logout or missing clientID/currentUser.");
+         ws.current.close();
+         ws.current = null; // Ensure ref is cleared after closing
+      }
+      return; // Exit if no clientID or not logged in
+    }
 
-    console.log("Attempting to connect WebSocket with Client ID:", clientId);
+    // If ws.current already exists and is open, don't reconnect (unless clientId/currentUser changed, handled by deps)
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+        console.log("WebSocket already open and connected for User:", currentUser.username, "Client ID:", clientId);
+        return;
+    }
+    
+    console.log("Attempting to connect WebSocket (User Authenticated):", currentUser.username, "Client ID:", clientId);
+    // connectWebSocket in api.js now uses the token from its module scope (set during login)
     ws.current = connectWebSocket(clientId, (message) => {
-      console.log("WebSocket message received:", message);
-      setAgentStream(prevStream => [...prevStream, message]); // Add new message to stream
+      console.log("WebSocket message received by App.jsx:", message);
+      setAgentStream(prevStream => [...prevStream, message]);
 
       // Example of how to handle different message types from backend
       if (message.type === 'phase_update') {
@@ -101,23 +143,87 @@ function App() {
       } else if (message.type === 'frontend_css_content') {
         console.log("Received frontend_css_content:", message);
         setFrontendCss(message.content || '');
-        // Note: CSS changes alone might not trigger iframeKey update if JS/HTML are main drivers.
-        // Consider if iframeKey logic needs to be more nuanced or if CSS is always bundled.
       } else if (message.type === 'frontend_js_content') {
         console.log("Received frontend_js_content:", message);
         setFrontendJs(message.content || '');
         setFrontendSandboxLogEntries([]);
+      } else if (message.type === 'agent_action' && message.action === 'web_search') {
+        // Message structure: { type: 'agent_action', action: 'web_search', query: 'search query', phase: 'current_phase' }
+        console.log("Received agent_action (web_search):", message);
+        // The message itself is already added to agentStream by the generic handler.
+        // No specific state update needed here beyond what AgentThoughts will render.
+      } else if (message.type === 'search_results') {
+        // Message structure: { type: 'search_results', results: [...], message: 'Web search completed.', phase: 'current_phase' }
+        console.log("Received search_results:", message);
+        // The message itself is already added to agentStream.
+        // AgentThoughts will be responsible for displaying this.
+      } else if (message.type === 'agent_action' && message.action === 'fetch_url') {
+        // Message structure: { type: 'agent_action', action: 'fetch_url', url: 'url_to_fetch', phase: 'current_phase' }
+        console.log("Received agent_action (fetch_url):", message);
+        // Added to agentStream by the generic handler below.
+      } else if (message.type === 'url_fetch_result') {
+        // Message structure: { type: 'url_fetch_result', url: 'url', content_snippet: '...', error: '...', phase: 'current_phase' }
+        console.log("Received url_fetch_result:", message);
+        // Added to agentStream by the generic handler below.
       }
+      // All messages are added to agentStream by the line:
+      // setAgentStream(prevStream => [...prevStream, message]);
+      // which should be located just before or after this block.
     });
 
     return () => {
-      if (ws.current) {
-        console.log("Closing WebSocket connection for Client ID:", clientId);
+      if (ws.current && (ws.current.readyState === WebSocket.OPEN || ws.current.readyState === WebSocket.CONNECTING)) {
+        console.log("Closing WebSocket connection (cleanup effect) for Client ID:", clientId, "User:", currentUser?.username);
         ws.current.close();
+        ws.current = null;
       }
     };
-  }, [clientId]); // Reconnect if clientId changes (should not happen often)
+  }, [clientId, currentUser]); // Add currentUser as dependency
 
+
+  const handleLoginSuccess = async () => {
+    setIsLoadingAuth(true);
+    try {
+      const user = await fetchCurrentUser();
+      setCurrentUser(user);
+      setShowLogin(true); // Should already be true if login form was shown, ensures main app view
+    } catch (error) {
+      setCurrentUser(null);
+      setError("Failed to fetch user data after login.");
+    } finally {
+      setIsLoadingAuth(false);
+    }
+  };
+
+  const handleLogout = () => {
+    if (ws.current && (ws.current.readyState === WebSocket.OPEN || ws.current.readyState === WebSocket.CONNECTING)) {
+      ws.current.close();
+      ws.current = null; // Clear the ref
+      console.log("WebSocket connection closed due to logout.");
+    }
+    logoutUser(); 
+    setCurrentUser(null);
+    setAgentStream([]); 
+    setGeneratedCode('');
+    setSandboxResults(null);
+    setFrontendHtml(''); 
+    setFrontendCss('');
+    setFrontendJs('');
+    setFrontendSandboxLogEntries([]);
+    setError(''); // Clear any general errors
+    // ClientID can remain. New WS connection on next login will use it.
+  };
+
+  const handleSwitchAuthMode = () => {
+    setShowLogin(!showLogin);
+    setError(''); // Clear errors when switching forms
+  };
+
+  const handleRegistrationSuccess = () => {
+    // alert("Registration successful! Please login."); // Using Typography for messages now
+    setShowLogin(true); // Switch to login form
+    // Error state is already cleared in RegisterForm on success
+  };
 
   const handleSubmitCommand = async () => {
     if (!command.trim()) {
