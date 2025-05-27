@@ -1,7 +1,109 @@
-/* Global styles - keep minimal or use for base resets */
-html {
-  box-sizing: border-box;
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Poppins:wght@300;400;500;600;700&display=swap');
+
+:root {
+  font-family: 'Inter', 'Poppins', system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color-scheme: light dark;
+  color: #111827;
+  background-color: #F3F4F6;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
-*, *:before, *:after {
-  box-sizing: inherit;
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+/* Animações */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fadeIn {
+  animation: fadeIn 0.5s ease;
+}
+
+/* Estilos para scrollbars personalizados */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a8a8a8;
+}
+
+/* Estilos para transições suaves */
+.MuiButton-root,
+.MuiIconButton-root,
+.MuiPaper-root,
+.MuiTextField-root {
+  transition: all 0.3s ease !important;
+}
+
+/* Efeitos de hover para elementos interativos */
+.MuiButton-root:hover,
+.MuiIconButton-root:hover {
+  transform: translateY(-2px);
+}
+
+/* Estilos para elementos neumórficos */
+.neumorphic {
+  border-radius: 10px;
+  background: linear-gradient(145deg, #ffffff, #f0f0f0);
+  box-shadow: 5px 5px 10px #d9d9d9, -5px -5px 10px #ffffff;
+}
+
+/* Estilos para gradientes sutis */
+.subtle-gradient {
+  background: linear-gradient(to right, #FFFFFF, #F9FAFB);
+}
+
+/* Estilos para acessibilidade */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+/* Estilos para responsividade em dispositivos móveis */
+@media (max-width: 600px) {
+  .hide-on-mobile {
+    display: none !important;
+  }
 }
